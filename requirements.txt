@@ -22,8 +22,10 @@ dotenv==0.9.9
 executing==2.2.1
 faiss-cpu==1.13.2
 filelock==3.25.2
+fpdf==1.7.2
 frozenlist==1.8.0
 fsspec==2026.3.0
+git-filter-repo==2.47.0
 gitdb==4.0.12
 GitPython==3.1.46
 groq==0.37.1
