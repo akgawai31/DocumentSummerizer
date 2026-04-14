@@ -1,115 +1,215 @@
-import tempfile
-from datetime import datetime, timezone
+import hashlib
+from typing import Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor
 
 from app.Loader import load_document
 from app.MetaData import Document
 from app.Processing import split_documents, get_embeddings, create_vectorstore
-
 from app.GroqClient import GroqClient
-from app.Tools import create_document_tools
 
+
+# ---------------- SIMPLE CACHE ----------------
+
+class Cache:
+    def __init__(self):
+        self.store = {}
+
+    def get(self, key):
+        return self.store.get(key)
+
+    def set(self, key, value):
+        self.store[key] = value
+
+
+# ---------------- RERANKER ----------------
+
+class SimpleReranker:
+    """
+    Lightweight reranker (no external model required)
+    Improves relevance by keyword overlap scoring.
+    """
+
+    @staticmethod
+    def score(query: str, text: str) -> float:
+        q_tokens = set(query.lower().split())
+        t_tokens = set(text.lower().split())
+
+        if not q_tokens:
+            return 0
+
+        return len(q_tokens.intersection(t_tokens)) / len(q_tokens)
+
+    def rerank(self, query: str, docs: List):
+        scored = [
+            (self.score(query, d.page_content), d)
+            for d in docs
+        ]
+
+        scored.sort(reverse=True, key=lambda x: x[0])
+
+        return [d for _, d in scored]
+
+
+# ---------------- RAG CORE ----------------
 
 class SmartDocAssistant:
 
     def __init__(self):
-        self.documents = {}
-        self.vectorstores = {}
-        self.model = GroqClient()
-        self.tools = create_document_tools(self)
-        self.agent, _ = self.model.build_agent()
+        self.docs: Dict[str, dict] = {}
 
-    def ensure_agent(self):
-        if self.agent is None:
-            self.tools = create_document_tools(self)
-            self.agent, _ = self.model.build_agent(self.tools)
-        return self.agent
+        self.cache = Cache()
+        self.reranker = SimpleReranker()
 
-    # ---------------- LOAD DOCUMENT ----------------
+        self.embeddings = get_embeddings()
+        self.llm = GroqClient()
 
-    def load_document_file(self, uploaded_file):
+    # ---------------- LOAD ----------------
+
+    def load_document(self, uploaded_file):
         file_type = uploaded_file.name.split(".")[-1]
 
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
-            tmp.write(uploaded_file.read())
-            tmp_path = tmp.name
+        raw_docs = load_document(uploaded_file, file_type)
 
-        raw_docs = load_document(tmp_path, file_type)
+        # simple chapter grouping (fallback safe)
+        chapters = {"FULL_DOC": raw_docs}
 
-        docs = []
-        for i, doc in enumerate(raw_docs):
-            metadata = {
-                "filename": uploaded_file.name,
-                "chunk_index": i,
-                "uploaded_at": datetime.now(timezone.utc).isoformat()
-            }
-            docs.append(Document(page_content=doc.page_content, metadata=metadata))
+        self.docs[uploaded_file.name] = {
+            "chapters": chapters,
+            "vectorstores": {}
+        }
 
-        self.documents[uploaded_file.name] = docs
-        return docs
+        return {"file": uploaded_file.name}
 
     # ---------------- PROCESS ----------------
 
-    def process_document(self, filename):
-        chunks = split_documents(self.documents[filename])
+    def process_document(self, filename: str):
+        data = self.docs.get(filename)
+        if not data:
+            return "Document not found"
 
-        embeddings = get_embeddings()
-        vectorstore = create_vectorstore(chunks, embeddings)
+        for chapter, docs in data["chapters"].items():
+            chunks = split_documents(docs)
 
-        self.vectorstores[filename] = vectorstore
-        return "Processed"
+            data["vectorstores"][chapter] = create_vectorstore(
+                chunks,
+                self.embeddings
+            )
 
-    # ---------------- RETRIEVE ----------------
+        return {"status": "processed"}
 
-    def retrieve(self, query, filename):
-        vs = self.vectorstores.get(filename)
-        if not vs:
-            return ""
+    # ---------------- RETRIEVAL ----------------
 
-        results = vs.similarity_search(query, k=3)
-        return "\n\n".join([r.page_content for r in results])
+    def retrieve(self, query: str, filename: str, chapter: Optional[str] = None, k: int = 10):
 
-    # ---------------- SUMMARIZE ----------------
+        cache_key = hashlib.md5(f"{filename}:{chapter}:{query}".encode()).hexdigest()
+        cached = self.cache.get(cache_key)
+        if cached:
+            return cached
 
-    def summarize_document(self, filename):
-        chunks = list(self.vectorstores[filename].docstore._dict.values())
+        data = self.docs.get(filename)
+        if not data:
+            return []
 
-        def summarize(c):
-            return self.agent.invoke({
-                "messages": [{
-                    "role": "user",
-                    "content": f"Summarize:\n{c.page_content}"
-                }]
-            })["messages"][-1].content
+        results = []
 
-        with ThreadPoolExecutor(max_workers=5) as ex:
-            summaries = list(ex.map(summarize, chunks[:10]))
+        # 1. vector retrieval
+        if chapter:
+            vs = data["vectorstores"].get(chapter)
+            if vs:
+                results = vs.similarity_search(query, k=k)
+        else:
+            for vs in data["vectorstores"].values():
+                results.extend(vs.similarity_search(query, k=3))
 
-        return "\n\n".join(summaries)
+        # 2. rerank results
+        results = self.reranker.rerank(query, results)
 
-    def summarize_chapter(self, filename, chapter):
-        return f"(Demo) Summary of {chapter} from {filename}"
+        # 3. limit final context
+        results = results[:6]
 
-    # ---------------- MAIN ENTRY ----------------
+        self.cache.set(cache_key, results)
 
-    def ask(self, question, filename=None):
-        if filename and filename not in self.documents:
-            return "Document not found."
+        return results
 
-        agent = self.ensure_agent()
+    # ---------------- CONTEXT BUILDER ----------------
 
-        response = agent.invoke({
-            "messages": [
-                {
-                    "role": "user",
-                    "content": f"""
-                    User is working with file: {filename}
+    def build_context(self, docs: List) -> str:
+        seen = set()
+        context_parts = []
 
-                    Question:
-                    {question}
-                    """
-                }
-            ]
+        for d in docs:
+            text = d.page_content.strip()
+
+            h = hashlib.md5(text.encode()).hexdigest()
+            if h in seen:
+                continue
+
+            seen.add(h)
+            context_parts.append(text)
+
+        return "\n\n".join(context_parts)
+
+    # ---------------- ASK (CORE RAG) ----------------
+
+    def ask(self, question: str, filename: str, chapter: Optional[str] = None):
+
+        docs = self.retrieve(question, filename, chapter)
+
+        context = self.build_context(docs)
+
+        prompt = f"""
+            You are a precise document assistant.
+
+            Use ONLY the context below.
+
+            Context:
+            {context}
+
+            Question:
+            {question}
+
+            Rules:
+            - If answer is not in context, say "Not found in document"
+            - Be concise
+        """
+
+        response = self.llm.invoke({
+            "messages": [{
+                "role": "user",
+                "content": prompt
+            }]
         })
 
         return response["messages"][-1].content
+
+    # ---------------- SUMMARIZATION ----------------
+
+    def summarize_document(self, filename: str):
+
+        data = self.docs.get(filename)
+        if not data:
+            return "Not found"
+
+        summaries = []
+
+        for chapter, vs in data["vectorstores"].items():
+            docs = vs.similarity_search("", k=8)
+
+            context = self.build_context(docs)
+
+            prompt = f"""
+                Summarize this section clearly:
+
+                {context}
+            """
+
+            res = self.llm.invoke({
+                "messages": [{
+                    "role": "user",
+                    "content": prompt
+                }]
+            })
+
+            summaries.append(f"### {chapter}\n{res}")
+
+        return "\n\n".join(summaries)
